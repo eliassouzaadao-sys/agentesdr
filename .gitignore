@@ -1,0 +1,28 @@
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Arquivos de ambiente com credenciais
+.env
+
+# Credenciais
+credentials.json
+token.json
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

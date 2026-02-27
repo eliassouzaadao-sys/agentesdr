@@ -122,6 +122,99 @@ class RedisService:
         await self.client.ltrim(key, -40, -1)
         await self.client.expire(key, 86400 * 7)  # 7 dias
 
+    async def add_to_history_with_summarization(
+        self,
+        sender: str,
+        role: str,
+        content: str,
+        summarize_callback=None,
+        max_messages: int = 30,
+        keep_recent: int = 10
+    ) -> None:
+        """
+        Adiciona mensagem ao histórico com sumarização automática.
+        Quando o histórico excede max_messages, sumariza as mensagens antigas
+        e mantém apenas as keep_recent mais recentes + o resumo.
+
+        Args:
+            sender: ID do remetente
+            role: Role da mensagem (user/assistant)
+            content: Conteúdo da mensagem
+            summarize_callback: Função async que recebe lista de mensagens e retorna resumo
+            max_messages: Número máximo antes de sumarizar
+            keep_recent: Quantidade de mensagens recentes a manter
+        """
+        key = f"{sender}_history"
+        summary_key = f"{sender}_summary"
+
+        # Adiciona nova mensagem
+        message = json.dumps({"role": role, "content": content})
+        await self.client.rpush(key, message)
+
+        # Verifica se precisa sumarizar
+        history_len = await self.client.llen(key)
+
+        if history_len > max_messages and summarize_callback:
+            logger.info(f"Histórico de {sender} tem {history_len} msgs - sumarizando...")
+
+            # Pega todas as mensagens
+            all_messages = await self.client.lrange(key, 0, -1)
+            all_messages = [json.loads(msg) for msg in all_messages]
+
+            # Separa mensagens antigas para sumarizar
+            messages_to_summarize = all_messages[:-keep_recent]
+            recent_messages = all_messages[-keep_recent:]
+
+            # Pega resumo anterior se existir
+            previous_summary = await self.client.get(summary_key)
+
+            try:
+                # Gera novo resumo incluindo o anterior
+                if previous_summary:
+                    summary_context = f"Resumo anterior: {previous_summary}\n\nNovas mensagens para incluir:"
+                    new_summary = await summarize_callback(messages_to_summarize, summary_context)
+                else:
+                    new_summary = await summarize_callback(messages_to_summarize)
+
+                if new_summary:
+                    # Salva novo resumo
+                    await self.client.set(summary_key, new_summary, ex=86400 * 30)  # 30 dias
+
+                    # Limpa histórico e adiciona mensagens recentes
+                    await self.client.delete(key)
+                    for msg in recent_messages:
+                        await self.client.rpush(key, json.dumps(msg))
+
+                    logger.info(f"Histórico de {sender} sumarizado: {len(messages_to_summarize)} msgs -> resumo + {len(recent_messages)} recentes")
+
+            except Exception as e:
+                logger.error(f"Erro ao sumarizar histórico: {e}")
+
+        await self.client.expire(key, 86400 * 7)  # 7 dias
+
+    async def get_conversation_summary(self, sender: str) -> Optional[str]:
+        """Retorna o resumo armazenado da conversação"""
+        summary_key = f"{sender}_summary"
+        return await self.client.get(summary_key)
+
+    async def get_history_with_summary(self, sender: str, limit: int = 20) -> List[dict]:
+        """
+        Retorna histórico de conversação incluindo resumo como contexto.
+        Se houver resumo, adiciona como primeira mensagem de sistema.
+        """
+        summary = await self.get_conversation_summary(sender)
+        history = await self.get_conversation_history(sender, limit)
+
+        if summary:
+            # Adiciona resumo como contexto no início
+            summary_message = {
+                "role": "system",
+                "content": f"Resumo da conversa anterior: {summary}"
+            }
+            return [summary_message] + history
+
+        return history
+
     async def clear_history(self, sender: str) -> None:
         """Limpa histórico de conversação"""
         key = f"{sender}_history"
@@ -135,10 +228,38 @@ class RedisService:
         await self.client.set(key, json.dumps(state), ex=86400 * 30)  # 30 dias
 
     async def get_lead_state(self, sender: str) -> Optional[dict]:
-        """Recupera estado do lead"""
+        """
+        Recupera estado do lead.
+        Tenta múltiplos formatos de número brasileiro para garantir que encontre.
+        """
         key = f"{sender}_state"
         state = await self.client.get(key)
-        return json.loads(state) if state else None
+
+        if state:
+            return json.loads(state)
+
+        # Tenta formato alternativo do número brasileiro
+        digits = sender.replace("@s.whatsapp.net", "")
+
+        # Se tem 12 dígitos (55 + DDD + 8), tenta com 9 extra
+        if len(digits) == 12 and digits.startswith("55"):
+            alt_sender = f"55{digits[2:4]}9{digits[4:]}@s.whatsapp.net"
+            alt_key = f"{alt_sender}_state"
+            alt_state = await self.client.get(alt_key)
+            if alt_state:
+                logger.debug(f"Estado encontrado com formato alternativo: {alt_sender}")
+                return json.loads(alt_state)
+
+        # Se tem 13 dígitos (55 + DDD + 9 + 8), tenta sem o 9
+        elif len(digits) == 13 and digits.startswith("55") and digits[4] == "9":
+            alt_sender = f"55{digits[2:4]}{digits[5:]}@s.whatsapp.net"
+            alt_key = f"{alt_sender}_state"
+            alt_state = await self.client.get(alt_key)
+            if alt_state:
+                logger.debug(f"Estado encontrado com formato alternativo: {alt_sender}")
+                return json.loads(alt_state)
+
+        return None
 
 
 # Instância singleton

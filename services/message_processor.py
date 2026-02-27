@@ -14,7 +14,7 @@ from services.tts_service import tts_service
 from services.followup_service import followup_service
 from services.supabase_service import supabase_service
 from config import get_settings
-from config.video_library import get_video_for_segment, is_video_library_configured
+from video_config.video_library import get_video_for_segment, is_video_library_configured
 from utils.media_decision import should_use_audio, clean_audio_tags
 from utils.message_splitter import split_message
 

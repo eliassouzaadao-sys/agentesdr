@@ -3,8 +3,9 @@ Serviço de Follow-up Automático
 Gerencia tentativas de contato quando o lead não responde
 """
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
 
@@ -65,21 +66,18 @@ class FollowUpService:
             except Exception as e:
                 logger.error(f"Erro no scheduler de follow-ups: {e}")
 
-            # Aguarda 5 minutos antes de verificar novamente
             await asyncio.sleep(300)
 
     async def _process_pending_followups(self):
         """Processa todos os follow-ups pendentes"""
-        # Busca todas as chaves de follow-up no Redis
         keys = await redis_service.client.keys("*_followup")
 
         now = datetime.now(BRAZIL_TZ)
         current_hour = now.hour
 
-        # Determina período atual
         current_period = self._get_current_period(current_hour)
         if not current_period:
-            return  # Fora dos horários de envio
+            return
 
         for key in keys:
             try:
@@ -90,7 +88,6 @@ class FollowUpService:
 
     def _get_current_period(self, hour: int) -> Optional[str]:
         """Retorna o período atual se estiver no horário de envio"""
-        # Janela de 1 hora para cada período
         if SCHEDULE_HOURS["morning"] <= hour < SCHEDULE_HOURS["morning"] + 1:
             return "morning"
         elif SCHEDULE_HOURS["afternoon"] <= hour < SCHEDULE_HOURS["afternoon"] + 1:
@@ -105,26 +102,20 @@ class FollowUpService:
         if not state:
             return
 
-        # Verifica se já atingiu o máximo de tentativas
         if state["attempts"] >= MAX_FOLLOWUP_ATTEMPTS:
             logger.info(f"Follow-up finalizado para {sender}: máximo de tentativas atingido")
             await self.cancel_followup(sender)
             return
 
-        # Verifica se o lead respondeu (follow-up cancelado)
         if state.get("cancelled", False):
             return
 
-        # Verifica se já enviou neste período hoje
         last_sent = state.get("last_sent")
         if last_sent:
             last_sent_dt = datetime.fromisoformat(last_sent)
-            if last_sent_dt.date() == now.date():
-                last_period = state.get("last_period")
-                if last_period == period:
-                    return  # Já enviou neste período hoje
+            if last_sent_dt.date() == now.date() and state.get("last_period") == period:
+                return
 
-        # Envia o follow-up
         await self._send_followup_message(sender, state, period)
 
     async def _send_followup_message(self, sender: str, state: Dict[str, Any], period: str):
@@ -133,7 +124,6 @@ class FollowUpService:
         from services.openai_service import openai_service
 
         # VERIFICAÇÃO DUPLA: Checa novamente se o lead respondeu antes de enviar
-        # Isso evita race condition entre o scheduler e o webhook de resposta
         current_state = await self.get_followup_state(sender)
         if not current_state or current_state.get("cancelled", False):
             logger.info(f"Follow-up cancelado para {sender} (verificação dupla antes do envio)")
@@ -142,11 +132,8 @@ class FollowUpService:
         attempts = state["attempts"] + 1
         nome = state.get("nome", "")
         segmento = state.get("segmento", "")
-
-        # Determina o dia (1, 2 ou 3)
         day = ((attempts - 1) // 3) + 1
 
-        # Gera mensagem personalizada
         prompt = get_followup_prompt(
             nome=nome,
             segmento=segmento,
@@ -156,7 +143,6 @@ class FollowUpService:
         )
 
         try:
-            # Gera a mensagem com IA
             message = await openai_service.generate_completion(prompt)
 
             if not message:
@@ -164,24 +150,19 @@ class FollowUpService:
                 return
 
             # VERIFICAÇÃO FINAL: Antes de enviar, confirma que o lead não respondeu
-            # (janela de tempo entre gerar mensagem e enviar)
             final_check = await self.get_followup_state(sender)
             if not final_check or final_check.get("cancelled", False):
                 logger.info(f"Follow-up cancelado para {sender} (verificação final antes do WhatsApp)")
                 return
 
-            # Envia via WhatsApp
             whatsapp = create_whatsapp_service()
-
-            # Alterna entre áudio e texto baseado no período/tentativa
-            # Manhã: texto, Tarde: áudio, Noite: texto
             use_audio = period == "afternoon" and attempts % 2 == 0
 
             if use_audio:
                 audio_bytes = await tts_service.text_to_audio(message)
                 if audio_bytes:
                     audio_base64 = tts_service.audio_to_base64(audio_bytes)
-                    await whatsapp.send_audio_with_presence(sender, audio_base64, duration=3.0)
+                    await whatsapp.send_audio_with_presence(sender, audio_base64, text_content=message)
                 else:
                     await whatsapp.send_long_message(sender, message)
             else:
@@ -195,8 +176,6 @@ class FollowUpService:
             state["last_message"] = message
 
             await self._save_followup_state(sender, state)
-
-            # Adiciona ao histórico de conversação
             await redis_service.add_to_history(sender, "assistant", message)
 
             logger.info(f"Follow-up #{attempts} enviado para {sender} (período: {period})")
@@ -204,16 +183,8 @@ class FollowUpService:
         except Exception as e:
             logger.error(f"Erro ao enviar follow-up para {sender}: {e}")
 
-    async def schedule_followup(
-        self,
-        sender: str,
-        nome: str,
-        segmento: str,
-    ):
-        """
-        Agenda follow-ups para um novo lead
-        Chamado após enviar a mensagem de boas-vindas
-        """
+    async def schedule_followup(self, sender: str, nome: str, segmento: str):
+        """Agenda follow-ups para um novo lead"""
         state = {
             "nome": nome,
             "segmento": segmento,
@@ -229,27 +200,55 @@ class FollowUpService:
 
     async def cancel_followup(self, sender: str):
         """
-        Cancela follow-ups quando o lead responde
-        Chamado quando recebemos uma mensagem do lead
+        Cancela follow-ups quando o lead responde.
+        Tenta múltiplos formatos de número para garantir o cancelamento.
         """
+        cancelled = False
+
+        # Tenta cancelar com o sender original
         state = await self.get_followup_state(sender)
         if state:
             state["cancelled"] = True
             await self._save_followup_state(sender, state)
             logger.info(f"Follow-up cancelado para {sender} (lead respondeu)")
+            cancelled = True
+
+        # Também tenta variações do número brasileiro (com/sem 9 extra)
+        # Extrai apenas os dígitos do sender
+        digits = sender.replace("@s.whatsapp.net", "")
+
+        # Se tem 12 dígitos (55 + DDD + 8), tenta com 9 extra
+        if len(digits) == 12 and digits.startswith("55"):
+            alt_sender = f"55{digits[2:4]}9{digits[4:]}@s.whatsapp.net"
+            alt_state = await self.get_followup_state(alt_sender)
+            if alt_state and not alt_state.get("cancelled"):
+                alt_state["cancelled"] = True
+                await self._save_followup_state(alt_sender, alt_state)
+                logger.info(f"Follow-up cancelado (formato alternativo): {alt_sender}")
+                cancelled = True
+
+        # Se tem 13 dígitos (55 + DDD + 9 + 8), tenta sem o 9
+        elif len(digits) == 13 and digits.startswith("55") and digits[4] == "9":
+            alt_sender = f"55{digits[2:4]}{digits[5:]}@s.whatsapp.net"
+            alt_state = await self.get_followup_state(alt_sender)
+            if alt_state and not alt_state.get("cancelled"):
+                alt_state["cancelled"] = True
+                await self._save_followup_state(alt_sender, alt_state)
+                logger.info(f"Follow-up cancelado (formato alternativo): {alt_sender}")
+                cancelled = True
+
+        if not cancelled:
+            logger.debug(f"Nenhum follow-up encontrado para {sender}")
 
     async def get_followup_state(self, sender: str) -> Optional[Dict[str, Any]]:
         """Recupera estado do follow-up"""
-        import json
         key = f"{sender}_followup"
         data = await redis_service.client.get(key)
         return json.loads(data) if data else None
 
     async def _save_followup_state(self, sender: str, state: Dict[str, Any]):
         """Salva estado do follow-up"""
-        import json
         key = f"{sender}_followup"
-        # TTL de 4 dias (um pouco mais que os 3 dias de follow-up)
         await redis_service.client.set(key, json.dumps(state), ex=86400 * 4)
 
 

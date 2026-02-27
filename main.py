@@ -2,16 +2,25 @@
 Agente SDR - FastAPI Application
 Webhooks para captura de leads e processamento de mensagens WhatsApp
 """
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from config import get_settings
-from models import Lead, LeadCapture, WhatsAppWebhook, WhatsAppMessage
+from middleware.auth import verify_api_key, verify_webhook_signature
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+from models import Lead, WhatsAppWebhook, WhatsAppMessage
 from services.redis_service import redis_service
 from services.sheets_service import sheets_service
 from services.whatsapp_service import create_whatsapp_service
@@ -57,6 +66,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Rate Limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -99,10 +112,12 @@ async def health():
 
 
 @app.post("/webhook/captura")
+@limiter.limit("30/minute")
 async def webhook_captura(request: Request, background_tasks: BackgroundTasks):
     """
     Webhook para captura de leads do formulário
     Fluxo: Salva no Sheets → Gera boas-vindas → Envia WhatsApp
+    Rate limit: 30 requisições por minuto
     """
     try:
         content_type = request.headers.get("content-type", "")
@@ -207,7 +222,7 @@ async def process_new_lead(lead: Lead):
             audio_bytes = await tts_service.text_to_audio(message)
             if audio_bytes:
                 audio_base64 = tts_service.audio_to_base64(audio_bytes)
-                await whatsapp.send_audio_with_presence(lead.remote_jid(), audio_base64, duration=3.0)
+                await whatsapp.send_audio_with_presence(lead.remote_jid(), audio_base64, text_content=message)
             else:
                 # Fallback para texto se TTS falhar
                 logger.warning("TTS falhou, enviando como texto")
@@ -233,13 +248,21 @@ async def process_new_lead(lead: Lead):
 
 
 @app.post("/webhook/whatsapp")
+@limiter.limit("60/minute")
 async def webhook_whatsapp(request: Request):
     """
     Webhook para mensagens do WhatsApp (Evolution API)
-    Fluxo: Filtra → Debounce → Processa com AI → Responde
+    Fluxo: Valida Signature → Filtra → Debounce → Processa com AI → Responde
+    Rate limit: 60 requisições por minuto
     """
     try:
-        body = await request.json()
+        # Lê body e valida assinatura
+        body_bytes = await request.body()
+        signature = request.headers.get("x-webhook-signature") or request.headers.get("X-Webhook-Signature")
+        verify_webhook_signature(body_bytes, signature)
+
+        # Parse JSON
+        body = json.loads(body_bytes)
         event = body.get("event", "")
         logger.info(f"Webhook WhatsApp: event={event}")
 
@@ -304,21 +327,21 @@ async def webhook_whatsapp(request: Request):
 
 
 @app.post("/admin/block/{sender}")
-async def block_chat(sender: str):
+async def block_chat(sender: str, _: bool = Depends(verify_api_key)):
     """Bloqueia chat para intervenção humana"""
     await redis_service.block_chat(sender)
     return {"status": "blocked", "sender": sender}
 
 
 @app.post("/admin/unblock/{sender}")
-async def unblock_chat(sender: str):
+async def unblock_chat(sender: str, _: bool = Depends(verify_api_key)):
     """Desbloqueia chat"""
     await redis_service.unblock_chat(sender)
     return {"status": "unblocked", "sender": sender}
 
 
 @app.get("/admin/lead/{sender}")
-async def get_lead_state(sender: str):
+async def get_lead_state(sender: str, _: bool = Depends(verify_api_key)):
     """Retorna estado do lead"""
     state = await redis_service.get_lead_state(sender)
     history = await redis_service.get_conversation_history(sender)
@@ -331,7 +354,7 @@ async def get_lead_state(sender: str):
 
 
 @app.get("/admin/summary/{sender}")
-async def get_conversation_summary(sender: str):
+async def get_conversation_summary(sender: str, _: bool = Depends(verify_api_key)):
     """Gera resumo da conversação"""
     settings = get_settings()
 
@@ -348,7 +371,7 @@ async def get_conversation_summary(sender: str):
 
 
 @app.get("/admin/followup/{sender}")
-async def get_followup_status(sender: str):
+async def get_followup_status(sender: str, _: bool = Depends(verify_api_key)):
     """Retorna status do follow-up para um lead"""
     state = await followup_service.get_followup_state(sender)
     if not state:
@@ -370,14 +393,14 @@ async def get_followup_status(sender: str):
 
 
 @app.post("/admin/followup/{sender}/cancel")
-async def admin_cancel_followup(sender: str):
+async def admin_cancel_followup(sender: str, _: bool = Depends(verify_api_key)):
     """Cancela follow-ups para um lead"""
     await followup_service.cancel_followup(sender)
     return {"status": "cancelled", "sender": sender}
 
 
 @app.post("/admin/followup/{sender}/trigger")
-async def trigger_followup(sender: str, background_tasks: BackgroundTasks):
+async def trigger_followup(sender: str, background_tasks: BackgroundTasks, _: bool = Depends(verify_api_key)):
     """Força envio de um follow-up imediatamente (para teste)"""
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -413,14 +436,25 @@ async def trigger_followup(sender: str, background_tasks: BackgroundTasks):
 
 
 @app.get("/api/leads")
-async def api_get_leads(status: Optional[str] = None):
-    """Retorna lista de leads para o CRM"""
-    leads = await supabase_service.get_all_leads(status)
-    return {"leads": leads}
+async def api_get_leads(
+    status: Optional[str] = None,
+    limit: int = Query(default=50, le=100, ge=1),
+    offset: int = Query(default=0, ge=0),
+    _: bool = Depends(verify_api_key)
+):
+    """Retorna lista de leads para o CRM com paginação"""
+    leads = await supabase_service.get_leads_paginated(status, limit, offset)
+    total = await supabase_service.count_leads(status)
+    return {
+        "leads": leads,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/api/leads/{remote_jid}")
-async def api_get_lead(remote_jid: str):
+async def api_get_lead(remote_jid: str, _: bool = Depends(verify_api_key)):
     """Retorna um lead especifico pelo remote_jid"""
     lead = await supabase_service.get_lead_by_remote_jid(remote_jid)
     if not lead:
@@ -429,14 +463,25 @@ async def api_get_lead(remote_jid: str):
 
 
 @app.get("/api/contatos")
-async def api_get_contatos(status: Optional[str] = None):
-    """Retorna lista de contatos para o CRM"""
-    contatos = await supabase_service.get_all_contatos(status)
-    return {"contatos": contatos}
+async def api_get_contatos(
+    status: Optional[str] = None,
+    limit: int = Query(default=50, le=100, ge=1),
+    offset: int = Query(default=0, ge=0),
+    _: bool = Depends(verify_api_key)
+):
+    """Retorna lista de contatos para o CRM com paginação"""
+    contatos = await supabase_service.get_contatos_paginated(status, limit, offset)
+    total = await supabase_service.count_contatos(status)
+    return {
+        "contatos": contatos,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/api/contatos/{remote_jid}")
-async def api_get_contato(remote_jid: str):
+async def api_get_contato(remote_jid: str, _: bool = Depends(verify_api_key)):
     """Retorna um contato especifico pelo remote_jid"""
     contato = await supabase_service.get_contato_by_remote_jid(remote_jid)
     if not contato:

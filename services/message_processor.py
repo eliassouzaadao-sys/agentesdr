@@ -4,25 +4,28 @@ Gerencia fluxo de mensagens recebidas com debounce, bloqueio e processamento
 """
 import asyncio
 import logging
-from typing import Optional, Callable, Awaitable
-from datetime import datetime
+from typing import Optional, Callable, Awaitable, Dict
 
 from models import WhatsAppWebhook, WhatsAppMessage, MessageType
 from services.redis_service import redis_service
 from services.whatsapp_service import create_whatsapp_service
 from services.openai_service import openai_service
 from services.tts_service import tts_service
+from services.followup_service import followup_service
+from services.supabase_service import supabase_service
 from config import get_settings
+from config.video_library import get_video_for_segment, is_video_library_configured
 from utils.media_decision import should_use_audio, clean_audio_tags
+from utils.message_splitter import split_message
 
 logger = logging.getLogger(__name__)
-
-# Armazena tasks de debounce ativas
-_debounce_tasks: dict[str, asyncio.Task] = {}
 
 
 class MessageProcessor:
     """Processa mensagens recebidas do WhatsApp"""
+
+    # Armazena tasks de debounce ativas (compartilhado entre instâncias)
+    _debounce_tasks: Dict[str, asyncio.Task] = {}
 
     def __init__(self):
         self.settings = get_settings()
@@ -43,6 +46,14 @@ class MessageProcessor:
             True se a mensagem foi processada, False se foi ignorada
         """
         sender = webhook.sender
+
+        # 0. CANCELAR FOLLOW-UP IMEDIATAMENTE quando o lead responde
+        # Isso deve acontecer ANTES do debounce para evitar race condition
+        try:
+            await followup_service.cancel_followup(sender)
+            logger.info(f"Follow-up cancelado imediatamente para {sender}")
+        except Exception as e:
+            logger.warning(f"Erro ao cancelar follow-up: {e}")
 
         # 1. Ignora mensagens próprias (fromMe)
         if webhook.is_from_me:
@@ -81,14 +92,10 @@ class MessageProcessor:
     ) -> Optional[str]:
         """Extrai conteúdo da mensagem baseado no tipo"""
 
-        if message_type == MessageType.CONVERSATION:
-            return webhook.get_text_content()
-
-        elif message_type == MessageType.EXTENDED_TEXT:
+        if message_type in [MessageType.CONVERSATION, MessageType.EXTENDED_TEXT]:
             return webhook.get_text_content()
 
         elif message_type == MessageType.AUDIO:
-            # Transcreve áudio
             logger.info(f"Processando áudio: message_id={webhook.message_id}")
             whatsapp = create_whatsapp_service(
                 webhook.server_url, webhook.apikey, webhook.instance
@@ -108,14 +115,10 @@ class MessageProcessor:
                 logger.warning(f"Não foi possível obter base64 do áudio: {media}")
 
         elif message_type == MessageType.IMAGE:
-            # Por enquanto, apenas log
             logger.info("Imagem recebida - processamento não implementado")
-            return None
 
         elif message_type == MessageType.DOCUMENT:
-            # Por enquanto, apenas log
             logger.info("Documento recebido - processamento não implementado")
-            return None
 
         return None
 
@@ -131,8 +134,8 @@ class MessageProcessor:
         await redis_service.add_to_buffer(sender, message.text)
 
         # Cancela task anterior se existir
-        if sender in _debounce_tasks:
-            _debounce_tasks[sender].cancel()
+        if sender in self._debounce_tasks:
+            self._debounce_tasks[sender].cancel()
 
         # Cria nova task de debounce
         async def debounce_handler():
@@ -176,16 +179,13 @@ class MessageProcessor:
             except Exception as e:
                 logger.error(f"Erro no debounce: {e}")
             finally:
-                if sender in _debounce_tasks:
-                    del _debounce_tasks[sender]
+                if sender in self._debounce_tasks:
+                    del self._debounce_tasks[sender]
 
-        _debounce_tasks[sender] = asyncio.create_task(debounce_handler())
+        self._debounce_tasks[sender] = asyncio.create_task(debounce_handler())
 
     async def _send_response(self, message: WhatsAppMessage, response: str):
         """Envia resposta via WhatsApp com decisão inteligente entre áudio e texto"""
-        from utils.message_splitter import split_message
-
-        # Cria serviço com credenciais da mensagem original
         whatsapp = create_whatsapp_service(
             message.server_url, message.apikey, message.instance
         )
@@ -197,7 +197,7 @@ class MessageProcessor:
         # Decide se usa áudio ou texto
         use_audio, reason = should_use_audio(
             clean_response,
-            is_first_contact=False,  # Já não é primeiro contato se está no SDR
+            is_first_contact=False,
             is_follow_up=False,
             has_audio_tag=has_audio_tag,
         )
@@ -207,41 +207,85 @@ class MessageProcessor:
 
         if use_audio:
             logger.info(f"Enviando resposta como ÁUDIO para {message.sender} ({reason})")
-
-            # Gera áudio
             audio_bytes = await tts_service.text_to_audio(clean_response)
 
             if audio_bytes:
-                # Converte para base64 e envia com presença "gravando"
                 audio_base64 = tts_service.audio_to_base64(audio_bytes)
                 await whatsapp.send_audio_with_presence(
                     message.sender,
                     audio_base64,
-                    duration=min(3.0, len(clean_response) / 100)  # Ajusta tempo baseado no tamanho
+                    text_content=clean_response  # Delay calculado pelo tamanho do texto
                 )
-                # Registra como mensagem da IA (para evitar loop)
                 await redis_service.add_ai_message(message.sender, clean_response)
             else:
-                # Fallback para texto se TTS falhar
                 logger.warning("TTS falhou, enviando como texto")
                 await self._send_as_text(whatsapp, message.sender, clean_response)
         else:
             logger.info(f"Enviando resposta como TEXTO para {message.sender} ({reason})")
             await self._send_as_text(whatsapp, message.sender, clean_response)
 
+        # Após enviar a resposta, verifica se deve enviar vídeo demo (primeira resposta)
+        await self._maybe_send_demo_video(whatsapp, message.sender)
+
     async def _send_as_text(self, whatsapp, sender: str, response: str):
         """Envia resposta como texto com split e delay"""
-        from utils.message_splitter import split_message
-
-        # Divide resposta em partes
         parts = split_message(response)
 
-        # Adiciona cada parte ao registro de mensagens da IA
         for part in parts:
             await redis_service.add_ai_message(sender, part)
 
-        # Envia com delay
         await whatsapp.send_messages_with_delay(sender, parts)
+
+    async def _maybe_send_demo_video(self, whatsapp, sender: str):
+        """
+        Envia vídeo demo se for a primeira resposta do lead e biblioteca estiver configurada.
+        O vídeo é selecionado com base no segmento do lead.
+        """
+        try:
+            # Verifica se biblioteca de vídeos está configurada
+            if not is_video_library_configured():
+                logger.debug("Biblioteca de vídeos não configurada")
+                return
+
+            # Verifica se já enviamos vídeo para este lead
+            video_sent_key = f"{sender}_video_sent"
+            already_sent = await redis_service.client.get(video_sent_key)
+            if already_sent:
+                logger.debug(f"Vídeo já enviado para {sender}")
+                return
+
+            # Busca estado do lead para pegar o segmento
+            state = await redis_service.get_lead_state(sender)
+            if not state:
+                logger.warning(f"Estado do lead não encontrado para envio de vídeo: {sender}")
+                return
+
+            segmento = state.get("segmento", "")
+
+            # Busca vídeo para o segmento
+            video = get_video_for_segment(segmento)
+            if not video or not video.get("url"):
+                logger.debug(f"Nenhum vídeo configurado para segmento: {segmento}")
+                return
+
+            # Envia o vídeo
+            logger.info(f"Enviando vídeo demo para {sender} (segmento: {segmento})")
+            success = await whatsapp.send_video_with_presence(
+                sender,
+                video["url"],
+                video.get("caption", ""),
+                delay_seconds=1.5
+            )
+
+            if success:
+                # Marca que o vídeo foi enviado (expira em 30 dias)
+                await redis_service.client.set(video_sent_key, "1", ex=86400 * 30)
+                logger.info(f"Vídeo demo enviado com sucesso para {sender}")
+            else:
+                logger.error(f"Falha ao enviar vídeo demo para {sender}")
+
+        except Exception as e:
+            logger.error(f"Erro ao enviar vídeo demo: {e}")
 
 
 # Instância singleton

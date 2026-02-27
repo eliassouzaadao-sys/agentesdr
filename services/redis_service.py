@@ -230,16 +230,20 @@ class RedisService:
     async def get_lead_state(self, sender: str) -> Optional[dict]:
         """
         Recupera estado do lead.
-        Tenta múltiplos formatos de número brasileiro para garantir que encontre.
+        Tenta múltiplos formatos de número brasileiro para garantir que encontre
+        o estado mais completo (com segmento).
         """
         key = f"{sender}_state"
         state = await self.client.get(key)
+        state_dict = json.loads(state) if state else None
 
-        if state:
-            return json.loads(state)
+        # Se encontrou estado completo (com segmento), retorna
+        if state_dict and state_dict.get("segmento"):
+            return state_dict
 
         # Tenta formato alternativo do número brasileiro
         digits = sender.replace("@s.whatsapp.net", "")
+        alt_state_dict = None
 
         # Se tem 12 dígitos (55 + DDD + 8), tenta com 9 extra
         if len(digits) == 12 and digits.startswith("55"):
@@ -247,8 +251,8 @@ class RedisService:
             alt_key = f"{alt_sender}_state"
             alt_state = await self.client.get(alt_key)
             if alt_state:
-                logger.debug(f"Estado encontrado com formato alternativo: {alt_sender}")
-                return json.loads(alt_state)
+                alt_state_dict = json.loads(alt_state)
+                logger.info(f"Estado encontrado com formato alternativo: {alt_sender}")
 
         # Se tem 13 dígitos (55 + DDD + 9 + 8), tenta sem o 9
         elif len(digits) == 13 and digits.startswith("55") and digits[4] == "9":
@@ -256,10 +260,15 @@ class RedisService:
             alt_key = f"{alt_sender}_state"
             alt_state = await self.client.get(alt_key)
             if alt_state:
-                logger.debug(f"Estado encontrado com formato alternativo: {alt_sender}")
-                return json.loads(alt_state)
+                alt_state_dict = json.loads(alt_state)
+                logger.info(f"Estado encontrado com formato alternativo: {alt_sender}")
 
-        return None
+        # Retorna o estado alternativo se for mais completo
+        if alt_state_dict and alt_state_dict.get("segmento"):
+            return alt_state_dict
+
+        # Retorna o estado original se existir
+        return state_dict
 
 
 # Instância singleton
